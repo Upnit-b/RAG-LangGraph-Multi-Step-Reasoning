@@ -104,7 +104,7 @@ def main():
 
         # Ensure the user's latest question is recorded
         if not messages or messages[-1] is not question:
-            messages = messages + question
+            messages = messages + [question]
 
         # If only one message and no rephrase is needed
         if len(messages) == 1:
@@ -160,7 +160,7 @@ def main():
         grader_llm_chain = grade_prompt | structured_llm
 
         # invoke -> returns pydantic GradeQuestion
-        result = grader_llm_chain.invoke()
+        result = grader_llm_chain.invoke({})
         on_topic_score = result.score.strip()
         print(f"question_classifier: on_topic = {on_topic_score}")
         return {"on_topic": on_topic_score}
@@ -289,14 +289,12 @@ def main():
 
         return {"messages": [generation]}
 
-
     def cannot_answer(state: AgentState):
         """This function is to trigger when the question is not relevant to RAG documents"""
 
         print("Entering cannot_answer")
 
         return {"messages": [AIMessage(content="I'm sorry, but I cannot find the information you're looking for.")]}
-
 
     def off_topic_response(state: AgentState):
         """This question is to trigger when the question is not as per RAG"""
@@ -340,11 +338,48 @@ def main():
     # Test Examples
 
     # 1. Off Topic
-    input_data = {"question": HumanMessage(
-        content="What does the company Apple do?")}
-    response = graph.invoke(input=input_data, config={
-                            "configurable": {"thread_id": 1}})
-    print(response)
+    # input_data = {
+    #     "question": HumanMessage(content="What does the company Apple do?"),
+    #     "messages": [],            # empty chat history
+    #     "documents": [],           # empty docs until retrieval
+    #     "on_topic": "",
+    #     "rephrased_question": "",
+    #     "proceed_to_generate": False,
+    #     "rephrase_count": 0,
+    # }
+    # response = graph.invoke(input=input_data, config={
+    #                         "configurable": {"thread_id": 1}})
+    # print(response)
+
+
+
+    # 2. No docs found
+    # input_data = {
+    #     "question": HumanMessage(content="What is the cancelation policy for Peak Performance Gym memberships?"),
+    #     "messages": [],            # empty chat history
+    #     "documents": [],           # empty docs until retrieval
+    #     "on_topic": "",
+    #     "rephrased_question": "",
+    #     "proceed_to_generate": False,
+    #     "rephrase_count": 0,
+    # }
+    # response = graph.invoke(input=input_data, config={
+    #                         "configurable": {"thread_id": 2}})
+    # print(response)
+
+    # 3. Rag With History
+    input_data = {
+        "question": HumanMessage(content="Who founded Peak Performance Gym?"),
+        "messages": [],            # empty chat history
+        "documents": [],           # empty docs until retrieval
+        "on_topic": "",
+        "rephrased_question": "",
+        "proceed_to_generate": False,
+        "rephrase_count": 0,
+    }
+    response1 = graph.invoke(input=input_data, config={
+                            "configurable": {"thread_id": 3}})
+    print(response1)
 
 
 if __name__ == "__main__":
