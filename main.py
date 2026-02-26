@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 from langgraph.graph import START, END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 
+load_dotenv()
+
 docs = [
     Document(
         page_content="Peak Performance Gym was founded in 2015 by former Olympic athlete Marcus Chen. With over 15 years of experience in professional athletics, Marcus established the gym to provide personalized fitness solutions for people of all levels. The gym spans 10,000 square feet and features state-of-the-art equipment.",
@@ -52,6 +54,9 @@ def main():
     # Create LLM model
     llm = ChatGroq(model="llama-3.1-8b-instant")
 
+    # Graph Memory
+    checkpointer = MemorySaver()
+
     # Create main template prompt
     template = """Answer the question based on the following context and the Chathistory. Especially take the latest question into consideration:
 
@@ -82,53 +87,264 @@ def main():
         score: str = Field(
             description="Question is about the specified topics? If yes -> 'Yes' if not -> 'No'")
 
+    class GradeDocument(BaseModel):
+        score: str = Field(
+            description="Document is relevant to the question? If yes -> 'Yes' if not -> 'No'"
+        )
+
     def question_rewriter(state: AgentState):
-        """This function rewrites the function if the question is not clear or ambigious"""
+        """Rewrites the user's question to be standalone for retrieval.
+        Returns partial state updates only (messages + rephrased_question)."""
+
         print(f"Entering question_rewriter with following state: {state}")
 
-        # Reset state variables except for 'question' and 'messages'
-        state["documents"] = []
-        state["on_topic"] = ""
-        state["rephrased_question"] = ""
-        state["proceed_to_generate"] = False
-        state["rephrase_count"] = 0
+        # Normalize inputs
+        messages = state.get("messages") or []
+        question = state["question"]
 
-        if "messages" not in state or state["messages"] is None:
-            state["messages"] = []
+        # Ensure the user's latest question is recorded
+        if not messages or messages[-1] is not question:
+            messages = messages + question
 
-        if state["question"] not in state["messages"]:
-            state["messages"].append(state["question"])
+        # If only one message and no rephrase is needed
+        if len(messages) == 1:
+            return {
+                "messages": messages,
+                "rephrased_question": question.content
+            }
 
-        if len(state["messages"]) > 1:
-            # get all the conversation except the last message to get context for rephrasing the question
-            conversation = state["messages"][:-1]
+        # Use prior conversation (except last) to rephrase
+        conversation = messages[:-1]
+        current_question = question.content
 
-            # get the main user question
-            current_question = state["question"].content
+        prompt_messages = [
+            SystemMessage(
+                content="You are a helpful assistant that rephrases the user's question to be a standalone question optimized for retrieval."),
+            *conversation,
+            HumanMessage(content=current_question)
+        ]
 
-            messages = [SystemMessage(
-                content="You are a helpful assistant that rephrases the user's question to be a standalone question optimized for retrieval.")]
+        rephrase_prompt = ChatPromptTemplate.from_messages(prompt_messages)
+        response = llm.invoke(rephrase_prompt.invoke({}))
+        better_question = response.content.strip()
 
-            messages.extend(conversation)
-            messages.append(HumanMessage(content=current_question))
-            rephrase_prompt = ChatPromptTemplate.from_messages(messages).format()
-            response = llm.invoke(rephrase_prompt)
-            better_question = response.content.strip()
-            print(f"question_rewriter: Rephrased question: {better_question}")
-            state["rephrased_question"] = better_question
-        else:
-            state["rephrased_question"] = state["question"].content
-        return state
+        print(f"question_rewriter: Rephrased Question: {better_question}")
 
-
+        return {
+            "messages": messages,
+            "rephrased_question": better_question
+        }
 
     def question_classifier(state: AgentState):
-        pass
+        """Classify whether the rephrased question is on-topic"""
+        print("Entering question classifier")
+
+        system_message = SystemMessage(content=""" You are a classifier that determines whether a user's question is about one of the following topics
+        1. Gym History & Founder
+        2. Operating Hours
+        3. Membership Plans
+        4. Fitness Classes
+        5. Personal Trainers
+        6. Facilities & Equipment
+        7. Anything else about Peak Performance Gym
+        If the question IS about any of these topics, respond with 'Yes'. Otherwise, respond with 'No'.
+        """)
+
+        human_message = HumanMessage(
+            content=f"User question: {state.get('rephrased_question', '')}")
+
+        grade_prompt = ChatPromptTemplate.from_messages(
+            [system_message, human_message])
+        structured_llm = llm.with_structured_output(GradeQuestion)
+
+        grader_llm_chain = grade_prompt | structured_llm
+
+        # invoke -> returns pydantic GradeQuestion
+        result = grader_llm_chain.invoke()
+        on_topic_score = result.score.strip()
+        print(f"question_classifier: on_topic = {on_topic_score}")
+        return {"on_topic": on_topic_score}
+
+    def on_topic_router(state: AgentState):
+        """This function routes the graph depending on whether the question is on topic or not"""
+        print("Entering on_topic_router")
+        on_topic = state.get("on_topic", "").strip().lower()
+        if on_topic == "yes":
+            print("Routing to retrieve")
+            return "retrieve"
+        else:
+            print("Routing to off_topic_response")
+            return "off_topic_response"
+
+    def retrieve(state: AgentState):
+        """This function retrieves the relevatn documents"""
+        print("Entering retrieve")
+        documents = retriever.invoke(state["rephrased_question"])
+        print(f"retrieve: Retrieved {len(documents)} documents")
+        return {"documents": documents}
+
+    def retrieval_grader(state: AgentState):
+        """Grade retrieved documents for relevance and return the filtered set"""
+
+        print("Entering retrieval_grader")
+
+        system_message = SystemMessage(
+            content="""You are a grader assessing the relevance of a retrieved document to a user question.
+            Only answer with 'Yes' or 'No'.
+            If the document contains information relevant to the user's question, respond with 'Yes'.
+            Otherwise, respond with 'No'."""
+        )
+
+        structured_llm = llm.with_structured_output(GradeDocument)
+
+        relevant_docs = []
+        for doc in state.get("documents", []):
+            human_message = HumanMessage(
+                content=f"User question: {state.get('rephrased_question', '')}\n\nRetrieved document:\n{doc.page_content}"
+            )
+            grade_prompt = ChatPromptTemplate.from_messages(
+                [system_message, human_message])
+
+            grader_llm = grade_prompt | structured_llm
+            result = grader_llm.invoke({})
+            score = (result.score or "").strip().lower()
+            print(
+                f"Grading document: {doc.page_content[:30]}... Result: {score}"
+            )
+            proceed = len(relevant_docs) > 0
+            print(
+                f"retrieval_grader: {len(relevant_docs)} relevant docs, proceed_to_generate = {proceed}")
+            return {"documents": relevant_docs, "proceed_to_generate": proceed}
+
+    def proceed_router(state: AgentState):
+        """This function decides whether the graph should proceed with generating content and invoking LLM or just say cannot answer"""
+
+        print("Entering proceed_router")
+        rephrase_count = state.get("rephrase_count", 0)
+        if state.get("proceed_to_generate", False):
+            print("Routing to generate_answer")
+            return "generate_answer"
+        elif rephrase_count >= 2:
+            print("Maximum rephrase attempts reached. Cannot find relevant documents.")
+            return "cannot_answer"
+        else:
+            print("Routing to refine_question")
+            return "refine_question"
+
+    def refine_question(state: AgentState):
+        """This function refines the question if its not clear"""
+
+        print("Entering refine_question")
+        rephrase_count = state.get("rephrase_count", 0)
+        if rephrase_count >= 2:
+            print("Maximum rephrase attempts reached")
+            return state
+
+        question_to_refine = state.get("rephrased_question", "")
+
+        system_message = SystemMessage(
+            content="""You are a helpful assistant that slightly refines the user's question to improve retrieval results.
+            Provide a slightly adjusted version of the question."""
+        )
+
+        human_message = HumanMessage(
+            content=f"Original question: {question_to_refine}\n\nProvide a slightly refined question."
+        )
+
+        refine_prompt = ChatPromptTemplate.from_messages(
+            [system_message, human_message])
+
+        response = llm.invoke(refine_prompt.invoke({}))
+        refined_question = response.content.strip()
+
+        print(f"refine_question: Refined question: {refined_question}")
+        return {"rephrased_question": refined_question, "rephrase_count": rephrase_count + 1}
+
+    def generate_answer(state: AgentState):
+        """This function calls the LLM and generates the answer"""
+
+        print("Entering generate_answer")
+
+        if "messages" not in state or state["messages"] is None:
+            raise ValueError(
+                "State must include 'messages' before generating an answer.")
+
+        history = state["messages"]
+        history_text = "\n".join(
+            f"{m.type.upper()}: {m.content}" for m in history
+        )
+        documents = state["documents"]
+        context = "\n\n".join(doc.page_content for doc in documents)
+
+        rephrased_question = state["rephrased_question"]
+
+        response = rag_chain.invoke(
+            {"history": history_text, "context": context,
+                "question": rephrased_question}
+        )
+
+        generation = response.content.strip()
+
+        print(f"generate_answer: Generated response: {generation}")
+
+        return {"messages": [generation]}
 
 
+    def cannot_answer(state: AgentState):
+        """This function is to trigger when the question is not relevant to RAG documents"""
+
+        print("Entering cannot_answer")
+
+        return {"messages": [AIMessage(content="I'm sorry, but I cannot find the information you're looking for.")]}
 
 
+    def off_topic_response(state: AgentState):
+        """This question is to trigger when the question is not as per RAG"""
 
+        print("Entering off_topic_response")
+
+        return {"messages": [AIMessage(
+                content="I'm sorry, but I cannot find the information you're looking for."
+                )]}
+
+    # Workflow
+    workflow = StateGraph(AgentState)
+    workflow.add_node("question_rewriter", question_rewriter)
+    workflow.add_node("question_classifier", question_classifier)
+    workflow.add_node("off_topic_response", off_topic_response)
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("retrieval_grader", retrieval_grader)
+    workflow.add_node("generate_answer", generate_answer)
+    workflow.add_node("refine_question", refine_question)
+    workflow.add_node("cannot_answer", cannot_answer)
+
+    workflow.add_edge(START, "question_rewriter")
+    workflow.add_edge("question_rewriter", "question_classifier")
+    workflow.add_conditional_edges("question_classifier", on_topic_router, {
+        "retrieve": "retrieve",
+        "off_topic_response": "off_topic_response"
+    })
+    workflow.add_edge("retrieve", "retrieval_grader")
+    workflow.add_conditional_edges("retrieval_grader", proceed_router, {
+        "generate_answer": "generate_answer",
+        "refine_question": "refine_question",
+        "cannot_answer": "cannot_answer"
+    })
+    workflow.add_edge("refine_question", "retrieve")
+    workflow.add_edge("generate_answer", END)
+    workflow.add_edge("cannot_answer", END)
+    workflow.add_edge("off_topic_response", END)
+
+    graph = workflow.compile(checkpointer=checkpointer)
+
+    # Test Examples
+
+    # 1. Off Topic
+    input_data = {"question": HumanMessage(
+        content="What does the company Apple do?")}
+    response = graph.invoke(input=input_data, config={
+                            "configurable": {"thread_id": 1}})
+    print(response)
 
 
 if __name__ == "__main__":
