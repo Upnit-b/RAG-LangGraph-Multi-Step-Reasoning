@@ -5,3 +5,5 @@ langchain_community
 langchain-groq
 python-dotenv
 langchain-tavily
+langchain_huggingface
+langchain_chroma
