@@ -4,11 +4,12 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
-from typing import TypedDict, List
+from typing import TypedDict, List, Annotated
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from langgraph.graph import START, END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
+import operator
 
 load_dotenv()
 
@@ -75,7 +76,7 @@ def main():
     # Create LangGraph Nodes and Functions
 
     class AgentState(TypedDict):
-        messages: List[BaseMessage]
+        messages: Annotated[List[BaseMessage], operator.add]
         documents: List[Document]
         on_topic: str
         rephrased_question: str
@@ -208,13 +209,16 @@ def main():
             grader_llm = grade_prompt | structured_llm
             result = grader_llm.invoke({})
             score = (result.score or "").strip().lower()
+            if score == "yes":
+                relevant_docs.append(doc)
             print(
                 f"Grading document: {doc.page_content[:30]}... Result: {score}"
             )
-            proceed = len(relevant_docs) > 0
-            print(
-                f"retrieval_grader: {len(relevant_docs)} relevant docs, proceed_to_generate = {proceed}")
-            return {"documents": relevant_docs, "proceed_to_generate": proceed}
+        proceed = len(relevant_docs) > 0
+        print(
+            f"retrieval_grader: {len(relevant_docs)} relevant docs, proceed_to_generate = {proceed}")
+        return {"documents": relevant_docs, "proceed_to_generate": proceed}
+
 
     def proceed_router(state: AgentState):
         """This function decides whether the graph should proceed with generating content and invoking LLM or just say cannot answer"""
@@ -287,7 +291,7 @@ def main():
 
         print(f"generate_answer: Generated response: {generation}")
 
-        return {"messages": [generation]}
+        return {"messages": [AIMessage(content=generation)]}
 
     def cannot_answer(state: AgentState):
         """This function is to trigger when the question is not relevant to RAG documents"""
